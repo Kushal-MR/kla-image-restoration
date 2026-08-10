@@ -85,6 +85,32 @@ def bicubic_baseline(loader, device, max_batches):
     return (S / max(n, 1)), (P / max(n, 1))
 
 
+def check_gpu_supported():
+    """
+    Fail early and readably if PyTorch has no kernels for this GPU.
+
+    Kaggle still offers the Tesla P100, but recent PyTorch builds dropped
+    support for its sm_60 architecture. Without this check the run dies deep
+    inside a .to(device) call with "CUDA error: no kernel image is available
+    for execution on the device", which reads like a bug in our code and is
+    not obviously about the GPU at all.
+    """
+    major, minor = torch.cuda.get_device_capability(0)
+    have = f"sm_{major}{minor}"
+    supported = {a.split("_")[1] for a in torch.cuda.get_arch_list() if a.startswith("sm_")}
+    if f"{major}{minor}" not in supported:
+        name = torch.cuda.get_device_name(0)
+        raise SystemExit(
+            f"\n{'='*70}\n"
+            f"This PyTorch build has no kernels for {name} ({have}).\n"
+            f"It supports: {', '.join('sm_' + s for s in sorted(supported))}\n\n"
+            f"On Kaggle: set Accelerator to 'GPU T4 x2' instead of 'GPU P100'.\n"
+            f"The P100 is sm_60 and current PyTorch builds no longer ship\n"
+            f"kernels for it.\n"
+            f"{'='*70}"
+        )
+
+
 def main():
     a = build_args()
     os.makedirs(a.out, exist_ok=True)
@@ -92,6 +118,7 @@ def main():
     print(f"device: {device}")
     if device == "cuda":
         print(f"gpu   : {torch.cuda.get_device_name(0)}")
+        check_gpu_supported()
         torch.backends.cudnn.benchmark = True   # only two input sizes, so warm-up is cheap
 
     torch.manual_seed(0); np.random.seed(0)

@@ -36,15 +36,24 @@ from degrade import Degrader, minmax, to_grey
 
 # ---------------------------------------------------------------------------
 def _load_any(path):
-    """Load a .npy or an image file (.png/.jpg) as a float32 2D greyscale array."""
+    """
+    Load a .npy or an image file (.png/.jpg) as a float32 2D greyscale array.
+
+    The rescaling depends on the FILE TYPE, never on the pixel values.
+    An earlier version used `if a.max() > 1.5: a /= 255`, which looked
+    harmless but destroyed a quarter of the degraded images: speckle noise
+    legitimately pushes NoisyLR above 1.5 (the problem statement says so
+    explicitly), and those images were being divided by 255 into near-black.
+    Never infer a file's scale from its content when the content is allowed
+    to exceed the expected range -- that is the whole premise of this task.
+    """
     if path.endswith(".npy"):
-        a = np.load(path)
+        a = np.asarray(np.load(path), dtype=np.float32)   # already 0-1, leave alone
     else:
-        a = np.asarray(Image.open(path))
-    a = to_grey(np.asarray(a, dtype=np.float32))
-    # PNG/JPG come in as 0-255; .npy from KLA is already 0-1.
-    if a.max() > 1.5:
-        a = a / 255.0
+        im = Image.open(path)
+        a = np.asarray(im, dtype=np.float32)
+        a = a / (65535.0 if im.mode == "I;16" else 255.0)  # 8- or 16-bit image file
+    a = to_grey(a)
     return np.nan_to_num(a, nan=0.0, posinf=1.0, neginf=0.0)
 
 
