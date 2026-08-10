@@ -1,0 +1,20 @@
+{
+  "L_median": 36.744,
+  "L_p5": 21.744,
+  "L_p95": 53.816,
+  "L_train_min": 10.87,
+  "L_train_max": 107.63,
+  "sigma_median": 0.018,
+  "sigma_train_min": 0.0,
+  "sigma_train_max": 0.045,
+  "downsample_kernels": [
+    "box",
+    "bilinear",
+    "bicubic",
+    "lanczos"
+  ],
+  "gt_is_minmax_normalised": true,
+  "scale": 2,
+  "sigma_note": "POORLY DETERMINED. Sensitivity test gave 0.010-0.024 depending on settings. Randomise over the range, do not trust a single value.",
+  "pre_blur_prob": 0.1
+}
