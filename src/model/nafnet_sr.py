@@ -154,9 +154,15 @@ class NAFNetSR(nn.Module):
         + bicubic upscaled input
     """
 
-    def __init__(self, width=32, enc_blocks=(2, 2, 4), middle_blocks=6,
-                 dec_blocks=(2, 2), scale=2):
+    def __init__(self, width=32, enc_blocks=(2, 2, 4), middle_blocks=8,
+                 dec_blocks=(2, 2, 2), scale=2):
         super().__init__()
+        # The U must be symmetric: one decoder stage per encoder stage.
+        # Three downsamples with only two upsamples leaves the output at half
+        # the input resolution, and the final `base + out` then fails on a
+        # size mismatch.
+        assert len(dec_blocks) == len(enc_blocks), \
+            "dec_blocks must have the same length as enc_blocks"
         self.scale = scale
 
         # 2 input channels = raw + signed-log
