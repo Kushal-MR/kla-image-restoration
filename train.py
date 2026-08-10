@@ -43,7 +43,11 @@ def build_args():
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--iters-per-epoch", type=int, default=800)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--workers", type=int, default=2)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--photo-cache", default=None,
+                   help="folder for the prepared greyscale photo cache. Built "
+                        "automatically on first use. Without it, training is "
+                        "bound by PNG decoding rather than by the GPU.")
     p.add_argument("--real-frac", type=float, default=0.25)
     p.add_argument("--val-batches", type=int, default=24)
     p.add_argument("--resume", default=None)
@@ -127,7 +131,23 @@ def main():
     train_names, easy_names, hard_names = load_split(a.split)
     print(f"split: train {len(train_names)}  val_easy {len(easy_names)}  val_hard {len(hard_names)}")
 
-    synth = SyntheticDataset(a.photos, a.cfg, gt_size=a.gt_size,
+    # Build the fast photo cache if asked for. Costs a few minutes once and
+    # removes ~1.1 s per iteration of PNG decoding thereafter.
+    photo_dir = a.photos
+    if a.photo_cache:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+        from prepare_photos import prepare, find_photos
+        n_src = len(find_photos(a.photos))
+        n_have = len([f for f in os.listdir(a.photo_cache)
+                      if f.endswith(".npy")]) if os.path.isdir(a.photo_cache) else 0
+        if n_have < n_src:
+            print(f"preparing photo cache ({n_have}/{n_src} done) -> {a.photo_cache}")
+            prepare(a.photos, a.photo_cache)
+        else:
+            print(f"photo cache ready: {n_have} photos in {a.photo_cache}")
+        photo_dir = a.photo_cache
+
+    synth = SyntheticDataset(photo_dir, a.cfg, gt_size=a.gt_size,
                              length=a.iters_per_epoch * a.batch)
     real_train = RealPairDataset(a.real, names=train_names, gt_size=a.gt_size)
     train_ds = MixedDataset(synth, real_train, real_frac=a.real_frac,
@@ -174,7 +194,15 @@ def main():
     for epoch in range(start_epoch, a.epochs):
         t0 = time.time()
         running = 0.0
+        # Split the epoch's wall clock into "waiting for data" and "computing".
+        # If t_data dominates, adding GPU power changes nothing -- the fix is
+        # the photo cache or more workers. Without this split you cannot tell
+        # a slow model from a slow data pipeline.
+        t_data = t_step = 0.0
+        t_mark = time.time()
         for it, (lr, gt) in enumerate(train_dl):
+            t_data += time.time() - t_mark        # time spent waiting for the batch
+            t_body = time.time()                  # everything after this is compute
             lr, gt = lr.to(device, non_blocking=True), gt.to(device, non_blocking=True)
             if device == "cuda":
                 lr = lr.to(memory_format=torch.channels_last)
@@ -191,8 +219,17 @@ def main():
             scaler.step(opt); scaler.update()
             running += loss.item()
 
-            if (it + 1) % 200 == 0:
-                print(f"  ep{epoch} it{it+1}/{a.iters_per_epoch} loss {running/(it+1):.4f}")
+            if device == "cuda":
+                torch.cuda.synchronize()      # CUDA is async; sync so timing is honest
+            t_step += time.time() - t_body
+            t_mark = time.time()
+
+            if (it + 1) % 100 == 0:
+                frac = t_data / max(t_data + t_step, 1e-9) * 100
+                print(f"  ep{epoch} it{it+1}/{a.iters_per_epoch} "
+                      f"loss {running/(it+1):.4f}  "
+                      f"{(t_data+t_step)/(it+1):.3f} s/it  "
+                      f"({frac:.0f}% waiting on data)", flush=True)
 
         sched.step()
         se, pe = evaluate(model, easy_dl, device, a.val_batches)
