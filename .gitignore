@@ -1,0 +1,31 @@
+# data — never commit these, they are hundreds of MB
+data/
+*.zip
+train/
+Test_NoisyLR/
+**/GT/
+**/NoisyLR/
+
+# model weights are tracked with Git LFS (see README); ignore stray ones
+*.pt
+*.pth
+*.onnx
+!weights/.gitkeep
+
+# restored outputs
+outputs/*
+!outputs/.gitkeep
+
+# python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# os / editor
+.DS_Store
+__MACOSX/
+.vscode/
+.idea/
