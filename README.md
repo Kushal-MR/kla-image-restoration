@@ -11,7 +11,7 @@ full-resolution image in one pass.
 |---|---|
 | Architecture | NAFNet-w32, pixel-shuffle ×2 head, bicubic residual skip |
 | Parameters | 29.16 M |
-| Inference | 9.8 s for 400 images end-to-end (24.5 ms/image, Tesla T4, batch 16) |
+| Inference | 10.4 s for 400 images end-to-end (26.1 ms/image, Tesla T4, batch 16; median of six runs) |
 | val_hard PSNR / SSIM / LPIPS | **26.68 dB / 0.6859 / 0.3755** |
 | bicubic baseline | 22.87 dB / 0.5410 / 0.4480 |
 
@@ -41,6 +41,30 @@ positional arguments, loads `weights/best.pt`, and writes one restored file
 per input using the **same filename**. It requires no edits to run. Inputs may
 be `.npy` (as supplied) or ordinary image files; each output is written in the
 same format as its input.
+
+### If `git lfs` is not installed
+
+`git lfs install` fails if the Git LFS binary is missing. Install it first:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install git-lfs
+# macOS
+brew install git-lfs
+# Windows, or anything else: https://git-lfs.com
+```
+
+**Or skip LFS entirely.** GitHub resolves LFS files for direct downloads, so
+the checkpoint can be fetched with an ordinary HTTP request and dropped into
+`weights/`:
+
+```bash
+curl -L -o weights/best.pt \
+  https://github.com/Kushal-MR/kla-image-restoration/raw/main/weights/best.pt
+```
+
+To confirm you have the real file and not the pointer: `best.pt` should be
+about **108 MB**. If it is a few hundred bytes, it is still a pointer.
 
 **Two requirements files, deliberately.** `requirements.txt` is the complete
 `pip freeze` from the training environment, as the submission asks for — 933
@@ -86,11 +110,27 @@ recovered to within 0.4%**.
 |---|---|---|
 | Speckle L | **36.82** (per-image 20.6–56.8) | ±3% |
 | Gaussian σ | **≈0.011** | moderate — see below |
-| Downsampling | smooth (averaging), not pixel-picking | high |
+| Downsampling | smooth (averaging), not pixel-picking | moderate — see note |
 | Which smooth kernel | **not identifiable** | box / bilinear / bicubic / lanczos are indistinguishable at this scale |
 
 The kernel result is an honest negative. Rather than guess, we randomise over
 all four during synthesis, which also improves robustness to unseen content.
+
+**On excluding `nearest`.** Two diagnostics disagree about how firmly
+pixel-picking can be ruled out, so the confidence above is stated as moderate
+rather than high. `scripts/day1_setup.py` compares the structure left in the
+residual after assuming each kernel: at n=250 it reports `nearest` at 0.0515
+against 0.0458 for the best smooth kernel, a 12% margin it declares
+inconclusive, and at smaller samples the ordering flips. A second test — the
+neighbour correlation of the residual — ranks `nearest` *closest* to white,
+the opposite conclusion.
+
+This does not affect the model. Training randomises over the four smooth
+kernels regardless, and both validation and testing use KLA's own degraded
+files rather than synthetic ones, so the measured scores already reflect
+whatever the true kernel is. It is recorded here because the repository's own
+tooling prints "inconclusive", and a reproduction that contradicts its README
+is worse than an unresolved question stated plainly.
 
 **σ required a correction.** The variance-law fit placed it at 0.02239, but σ²
 is that fit's *intercept*, which absorbs any error not scaling with `I²`.
@@ -229,9 +269,9 @@ inference — not just the forward pass. This matters more than it sounds:
 | | ms/image |
 |---|---|
 | forward pass alone | 7.99 |
-| **end-to-end measured** | **24.5** |
+| **end-to-end measured (median)** | **26.1** |
 
-**Two thirds of the measured time is not the model.** Accordingly:
+**69% of the measured time is not the model.** Accordingly:
 
 - `torch.compile` is **not** used: its 30–60 s warm-up falls inside the measured
   window and is not recovered over a 400-image test set.
@@ -275,9 +315,17 @@ Representative successes and failures at full resolution are in `outputs/`.
 
 **Timing method:** wall-clock around the entire `inference.py` process — Python
 startup, imports, model load, 400 reads, inference and 400 writes — on a Tesla
-T4 (Kaggle), batch size 16. KLA benchmarks on an H100, which will be
-substantially faster, and which additionally supports bf16 and the
-channels_last path the T4 could not run.
+T4 (Kaggle), batch size 16.
+
+Six runs: **9.8, 10.2, 10.4, 10.5, 14.7, 16.1 s**, median **10.4 s**. We quote
+the median rather than the best. The script's own internal measurement is
+far steadier (7.51–8.81 s, median 7.78), so the spread is startup and page
+cache, not the model: the two slowest runs immediately followed a fresh
+`git clone`, with nothing yet in the filesystem cache. Kaggle's T4s are also
+shared, so I/O contention varies.
+
+KLA benchmarks on an H100, which will be substantially faster, and which
+additionally supports bf16 and the channels_last path the T4 could not run.
 
 **Independently reproduced.** Every figure in this README was regenerated from
 the checkpoint and the supplied data by `notebooks/replicate.ipynb`, using an
@@ -351,6 +399,28 @@ python inference.py data/Test_NoisyLR outputs/test_out
 The exact training run that produced `weights/best.pt` is preserved in
 `notebooks/kla-hackathon.ipynb`.
 
+## How the weights are stored
+
+For anyone reproducing this repository's structure rather than just running it.
+`best.pt` is 108 MB, above GitHub's 100 MB single-file limit, so a normal push
+is rejected. It is committed through Git LFS:
+
+```bash
+git lfs install
+git lfs track "weights/*.pt"          # writes the rule into .gitattributes
+git add .gitattributes weights/best.pt
+git commit -m "store weights via LFS"
+git push
+```
+
+The restored test outputs are tracked the same way
+(`outputs/test_out/*.npy`). Both rules are already committed in
+`.gitattributes`, so a fresh clone needs only `git lfs pull` — see Quick start.
+
+One caveat worth knowing: Git LFS on a free account allows 1 GB of bandwidth
+per month, and this repository holds roughly 210 MB in LFS. If `git lfs pull`
+ever fails with a quota error, use the direct download shown in Quick start.
+
 ## External resources
 
 | Resource | Link | Licence | Reference |
@@ -365,7 +435,8 @@ objective.
 
 ## Limitations and further work
 
-- The specific smooth downsampling kernel could not be identified (§1).
+- The specific smooth downsampling kernel could not be identified, and two
+  diagnostics disagree on how firmly pixel-picking can be excluded (§1).
 - One reference-free noise measurement remains unexplained (§2).
 - Checkpoints are selected on PSNR alone, though three metrics are scored. SSIM
   continued improving for several epochs after PSNR peaked; a combined selection
