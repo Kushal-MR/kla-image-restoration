@@ -4,9 +4,15 @@ inference.py — KLA benchmarking entry point.
 
     python inference.py <test_images_dir> <output_dir>
 
-Reads every degraded .npy in the input directory, restores it to 2x
+Reads every degraded image in the input directory, restores it to 2x
 resolution, and writes the result to the output directory under the SAME
 filename. Runs end to end with no manual edits.
+
+Inputs may be .npy (the format supplied for this challenge) or ordinary image
+files. Each output is written back in the format of its input, so a .npy in
+gives a .npy out. Accepting both matters because the script is run as-is by
+the benchmarking team: if the final test set arrives as PNG and the script
+only reads .npy, it produces nothing and the submission cannot be scored.
 
 INFERENCE-TIME NOTES
 --------------------
@@ -49,11 +55,42 @@ from nafnet_sr import NAFNetSR  # noqa: E402
 DEFAULT_WEIGHTS = os.path.join(HERE, "weights", "best.pt")
 
 
-def load_npy(path):
-    a = np.asarray(np.load(path), dtype=np.float32)
+IMAGE_EXTS = (".npy", ".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp")
+
+
+def load_image(path):
+    """Return (2D float32 array, kind) where kind says how to write it back.
+
+    Scale is decided by FILE TYPE and dtype, never by the pixel values: the
+    degraded images legitimately exceed [0,1] -- that is the whole premise of
+    this challenge -- so any value-based heuristic would corrupt them.
+    """
+    if path.lower().endswith(".npy"):
+        a = np.asarray(np.load(path), dtype=np.float32)
+        kind = "npy"
+    else:
+        from PIL import Image
+        im = Image.open(path)
+        a = np.asarray(im)
+        if a.ndim == 3:                       # colour -> luminance
+            a = a[..., :3] @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        kind = "png16" if im.mode == "I;16" else "png8"
+        a = np.asarray(a, dtype=np.float32) / (65535.0 if kind == "png16" else 255.0)
     # One NaN propagates through every convolution and ruins the whole output.
     # Cheap to guard, expensive to miss.
-    return np.nan_to_num(a, nan=0.0, posinf=1.0, neginf=0.0)
+    return np.nan_to_num(a, nan=0.0, posinf=1.0, neginf=0.0), kind
+
+
+def save_image(path, arr, kind):
+    if kind == "npy":
+        np.save(path, np.ascontiguousarray(arr, dtype=np.float32))
+        return
+    from PIL import Image
+    if kind == "png16":
+        Image.fromarray((arr * 65535).round().astype(np.uint16), mode="I;16").save(
+            path, compress_level=1)
+    else:
+        Image.fromarray((arr * 255).round().astype(np.uint8)).save(path, compress_level=1)
 
 
 def _select_runtime(model, device, sample_arr):
@@ -106,8 +143,8 @@ def main():
     t_start = time.time()
 
     ap = argparse.ArgumentParser(description="Restore degraded images.")
-    ap.add_argument("input_dir", help="directory of degraded .npy images")
-    ap.add_argument("output_dir", help="directory to write restored .npy images to")
+    ap.add_argument("input_dir", help="directory of degraded images (.npy or image files)")
+    ap.add_argument("output_dir", help="directory to write restored images to")
     ap.add_argument("--weights", default=DEFAULT_WEIGHTS)
     ap.add_argument("--batch", type=int, default=16)
     args = ap.parse_args()
@@ -117,9 +154,10 @@ def main():
     # Skip macOS resource-fork duplicates (._000000.npy). Archives made on a
     # Mac are full of them and loading one yields garbage.
     files = sorted(f for f in os.listdir(args.input_dir)
-                   if f.endswith(".npy") and not f.startswith("._"))
+                   if f.lower().endswith(IMAGE_EXTS) and not f.startswith("._"))
     if not files:
-        print(f"no .npy files found in {args.input_dir}", file=sys.stderr)
+        print(f"no images found in {args.input_dir} "
+              f"(looked for {', '.join(IMAGE_EXTS)})", file=sys.stderr)
         sys.exit(1)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -142,7 +180,9 @@ def main():
     model = model.to(device).eval()
 
     pool = ThreadPoolExecutor(max_workers=4)
-    arrays = list(pool.map(lambda f: load_npy(os.path.join(args.input_dir, f)), files))
+    loaded = list(pool.map(lambda f: load_image(os.path.join(args.input_dir, f)), files))
+    arrays = [a for a, _ in loaded]
+    kinds = {f: k for f, (_, k) in zip(files, loaded)}
 
     # Pick the fastest configuration that ACTUALLY RUNS on this GPU.
     #
@@ -184,8 +224,8 @@ def main():
 
                 for (name, _), out in zip(chunk, y):
                     writes.append(pool.submit(
-                        np.save, os.path.join(args.output_dir, name),
-                        np.ascontiguousarray(out, dtype=np.float32)))
+                        save_image, os.path.join(args.output_dir, name),
+                        out, kinds[name]))
                     n_done += 1
 
     for w in writes:

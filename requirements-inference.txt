@@ -1,0 +1,17 @@
+# Minimal environment to RUN inference.py.
+#
+# requirements.txt is the complete `pip freeze` from the training environment,
+# as the submission requires. It is a Kaggle image: 933 packages, and it pins
+# torch==2.10.0+cu128, a CUDA build that is not on PyPI. Installing it on a
+# clean machine fails. Use this file to run the model; use requirements.txt to
+# know exactly what the training environment contained.
+#
+#   pip install -r requirements-inference.txt
+#
+# Install the torch build that matches your CUDA version. For CUDA 12.8:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# CPU only:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0
+numpy>=1.24
+Pillow>=9.0

@@ -20,21 +20,37 @@ full-resolution image in one pass.
 ## Quick start
 
 ```bash
-git clone https://github.com/<user>/kla-image-restoration.git
+git clone https://github.com/Kushal-MR/kla-image-restoration.git
 cd kla-image-restoration
-pip install -r requirements.txt
+
+# The trained weights are stored in Git LFS. Without this step best.pt is a
+# ~130 byte pointer file and the model will not load.
+git lfs install && git lfs pull
+
+# Minimal environment to run the model. Install a torch build matching your
+# CUDA version first, e.g. for CUDA 12.8:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements-inference.txt
 
 # restore a directory of degraded images
 python inference.py /path/to/test_images /path/to/output_dir
 ```
 
 `inference.py` takes the test-image directory and the output directory as
-positional arguments, loads `weights/best.pt`, and writes one restored `.npy`
-per input using the **same filename**. It requires no edits to run.
+positional arguments, loads `weights/best.pt`, and writes one restored file
+per input using the **same filename**. It requires no edits to run. Inputs may
+be `.npy` (as supplied) or ordinary image files; each output is written in the
+same format as its input.
 
-Model weights are tracked with Git LFS (`best.pt` is 104 MB, above GitHub's
-100 MB single-file limit). If `weights/best.pt` looks like a small text file,
-run `git lfs install && git lfs pull`.
+**Two requirements files, deliberately.** `requirements.txt` is the complete
+`pip freeze` from the training environment, as the submission asks for — 933
+packages from a Kaggle image, pinning `torch==2.10.0+cu128`, a CUDA build that
+is not published on PyPI. It records what training ran on; it is not
+installable on an arbitrary machine. `requirements-inference.txt` is the small
+set actually needed to run the model.
+
+Weights are tracked with Git LFS because `best.pt` is 108 MB, above GitHub's
+100 MB single-file limit.
 
 ---
 

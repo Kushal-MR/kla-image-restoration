@@ -71,7 +71,8 @@ def read_checkpoint(path):
 def check_files():
     print("\n1. required files present and committed")
     required = [
-        "inference.py", "train.py", "requirements.txt", "README.md",
+        "inference.py", "train.py", "requirements.txt",
+        "requirements-inference.txt", "README.md",
         "src/nafnet_sr.py", "src/make_training_data.py",
         "configs/degradation_config.json", "configs/split.json",
         "weights/best.pt", "outputs/results/metrics.json",
@@ -145,6 +146,17 @@ def check_inference_cli():
             pos.append(n.args[0].value)
     check("takes input_dir and output_dir positionally",
           pos[:2] == ["input_dir", "output_dir"], f"found {pos}")
+    # A reviewer follows the README literally. If it tells them to install a
+    # file that cannot install, requirement 1 is not met however good the
+    # model is.
+    rd = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+    quick = rd[rd.index("## Quick start"):rd.index("## Approach")]
+    check("README quick start does not install the full training freeze",
+          "pip install -r requirements.txt" not in quick)
+    check("README quick start pulls Git LFS before running",
+          "git lfs pull" in quick)
+    check("README clone URL is real, not a placeholder",
+          "<user>" not in quick and "github.com/Kushal-MR" in quick)
     # Look for an actual CALL, not the string: the file contains a comment
     # explaining why torch.compile is avoided, and matching text would flag it.
     uses_compile = any(
