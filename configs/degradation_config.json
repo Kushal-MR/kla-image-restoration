@@ -1,20 +1,21 @@
 {
-  "L_median": 36.744,
-  "L_p5": 21.744,
-  "L_p95": 53.816,
-  "L_train_min": 10.87,
-  "L_train_max": 107.63,
-  "sigma_median": 0.018,
-  "sigma_train_min": 0.0,
-  "sigma_train_max": 0.045,
+  "L_measured": 36.82,
+  "sigma_measured": 0.011,
+  "L_train_range": [
+    10.3,
+    113.5
+  ],
+  "sigma_train_range": [
+    0.0,
+    0.025
+  ],
   "downsample_kernels": [
-    "box",
-    "bilinear",
     "bicubic",
+    "bilinear",
+    "box",
     "lanczos"
   ],
-  "gt_is_minmax_normalised": true,
   "scale": 2,
-  "sigma_note": "POORLY DETERMINED. Sensitivity test gave 0.010-0.024 depending on settings. Randomise over the range, do not trust a single value.",
-  "pre_blur_prob": 0.1
+  "gt_is_minmax_normalised": true,
+  "sigma_note": "The variance-law fit gave 0.02239, but sigma^2 is that fit's intercept and absorbs any error not scaling with intensity. Measured a second way from the depth of the negative tail (only additive noise can push a pixel below zero): real data dips to -0.0022 with 57% negative; 0.0224 gives -0.0269/74%, 0.0060 gives +0.0036/42%. Bracketing gives ~0.011."
 }

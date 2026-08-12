@@ -1,30 +1,38 @@
 #!/usr/bin/env python3
 """
-Preflight — verify the repository before spending GPU time on it.
+Preflight — verify the repository before it is submitted or benchmarked.
 
-Runs without PyTorch installed (torch is stubbed where needed), so it can be
-run anywhere in a couple of seconds. Every check here exists because the
-corresponding mistake was actually made at least once:
+Runs in seconds and needs neither a GPU nor PyTorch. Every check exists
+because the corresponding mistake was actually made at least once during the
+project:
 
-  1. every file referenced by an import is present and committed
-  2. the notebook uses no undefined variables across cells
-  3. every command-line flag the notebook passes exists in train.py
-  4. train.py can find scripts/prepare_photos.py the way it imports it
-  5. the U-Net's encoder/decoder stages balance, so output = 2x input
-  6. the data pipeline produces correct shapes and ranges, cached and raw
-  7. GT is exactly [0,1]; degraded input is allowed outside it
+  1. every file the code imports is present AND committed
+  2. the checkpoint's architecture matches src/nafnet_sr.py
+  3. inference.py declares the two positional arguments KLA will pass
+  4. the restored test outputs are complete, correctly shaped and in range
+  5. the split is honest: train and val_hard do not overlap
+  6. the reported metrics are internally consistent
 
     python scripts/preflight.py
 """
 
 import ast
+import collections
+import io
 import json
 import os
-import shutil
+import pickle
+import re
 import subprocess
 import sys
-import tempfile
-import types
+import zipfile
+
+# Windows consoles default to a legacy code page; force UTF-8 so printing a
+# detail string containing a non-ASCII character cannot crash the report.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FAILS = []
@@ -37,15 +45,37 @@ def check(name, ok, detail=""):
     return ok
 
 
-# ---------------------------------------------------------------------------
-def check_files_present():
-    print("\n1. required files present and tracked by git")
+def read_checkpoint(path):
+    """Read a .pt without torch: it is a zip whose data.pkl names torch classes."""
+    z = zipfile.ZipFile(path)
+    pkl = [n for n in z.namelist() if n.endswith("data.pkl")][0]
+
+    class Stub:
+        def __init__(self, *a, **k): pass
+
+    class T:
+        def __init__(self, size): self.size = size
+
+    def rebuild(storage, offset, size, stride, *a): return T(size)
+
+    class U(pickle.Unpickler):
+        def find_class(self, mod, name):
+            if name.startswith("_rebuild_tensor"): return rebuild
+            if name == "OrderedDict": return collections.OrderedDict
+            return Stub
+        def persistent_load(self, pid): return pid
+
+    return U(io.BytesIO(z.read(pkl))).load()
+
+
+def check_files():
+    print("\n1. required files present and committed")
     required = [
-        "train.py", "evaluate.py", "requirements.txt",
-        "src/degrade.py", "src/dataset.py", "src/model/nafnet_sr.py",
-        "scripts/prepare_photos.py", "scripts/preflight.py",
+        "inference.py", "train.py", "requirements.txt", "README.md",
+        "src/nafnet_sr.py", "src/make_training_data.py",
         "configs/degradation_config.json", "configs/split.json",
-        "notebooks/kla_train_kaggle.ipynb",
+        "weights/best.pt", "outputs/results/metrics.json",
+        "notebooks/kla-hackathon.ipynb", ".gitattributes",
     ]
     try:
         tracked = set(subprocess.run(["git", "-C", ROOT, "ls-files"],
@@ -55,232 +85,175 @@ def check_files_present():
     for f in required:
         on_disk = os.path.exists(os.path.join(ROOT, f))
         if tracked is None:
-            check(f"{f} on disk", on_disk)
+            check(f, on_disk)
         else:
-            check(f"{f}", on_disk and f in tracked,
-                  "" if (on_disk and f in tracked)
-                  else ("not on disk" if not on_disk else "on disk but NOT committed"))
+            ok = on_disk and f in tracked
+            check(f, ok, "" if ok else ("not on disk" if not on_disk
+                                        else "on disk but not staged/committed -- run: git add -A"))
+    # LFS must cover the weights, or GitHub rejects the push (>100 MB)
+    attrs = open(os.path.join(ROOT, ".gitattributes"), encoding="utf-8").read() if \
+        os.path.exists(os.path.join(ROOT, ".gitattributes")) else ""
+    size_mb = os.path.getsize(os.path.join(ROOT, "weights/best.pt")) / 1e6
+    check("weights tracked by Git LFS", "weights/*.pt" in attrs and "lfs" in attrs,
+          f"best.pt is {size_mb:.0f} MB; GitHub rejects >100 MB without LFS")
 
 
-# ---------------------------------------------------------------------------
-def check_notebook():
-    print("\n2. notebook: no undefined names across cells")
-    import builtins
-    nb = json.load(open(os.path.join(ROOT, "notebooks/kla_train_kaggle.ipynb")))
-    known = set(dir(builtins))
-    problems = []
-    for i, c in enumerate(nb["cells"]):
-        if c["cell_type"] != "code":
-            continue
-        try:
-            tree = ast.parse("\n".join(c["source"]))
-        except SyntaxError as e:
-            problems.append((i, [f"SyntaxError: {e}"])); continue
-        used, defd = set(), set()
-        for n in ast.walk(tree):
-            if isinstance(n, ast.Name):
-                (used if isinstance(n.ctx, ast.Load) else defd).add(n.id)
-            elif isinstance(n, (ast.Import, ast.ImportFrom)):
-                for al in n.names:
-                    defd.add(al.asname or al.name.split(".")[0])
-            elif isinstance(n, ast.comprehension):
-                for t in ast.walk(n.target):
-                    if isinstance(t, ast.Name):
-                        defd.add(t.id)
-        miss = sorted(used - defd - known)
-        if miss:
-            problems.append((i, miss))
-        known |= defd
-    check("all notebook cells resolve", not problems, str(problems))
-    return nb
+def check_architecture():
+    print("\n2. checkpoint matches src/nafnet_sr.py")
+    ck = read_checkpoint(os.path.join(ROOT, "weights/best.pt"))
+    sd, cfg = ck["model"], ck["cfg"]
+    keys = list(sd)
+    n_par = 0
+    for v in sd.values():
+        if hasattr(v, "size"):
+            n = 1
+            for d in v.size:
+                n *= d
+            n_par += n
+    print(f"         checkpoint: {len(keys)} tensors, {n_par:,} params, "
+          f"epoch {ck.get('epoch')}, cfg {cfg}")
+
+    src = open(os.path.join(ROOT, "src/nafnet_sr.py"), encoding="utf-8").read()
+    top = sorted({k.split(".")[0] for k in keys})
+    missing = [m for m in top if f"self.{m}" not in src]
+    check("every checkpoint module exists in the architecture", not missing,
+          f"missing: {missing}")
+
+    enc = max(int(m) for m in re.findall(r"encoders\.(\d+)\.", " ".join(keys))) + 1
+    dec = max(int(m) for m in re.findall(r"decoders\.(\d+)\.", " ".join(keys))) + 1
+    mid = max(int(m) for m in re.findall(r"middle_blks\.(\d+)\.", " ".join(keys))) + 1
+    check("encoder/decoder stages balance", enc == dec, f"enc {enc}, dec {dec}")
+    check("stage counts match cfg", enc == len(cfg["enc_blk_nums"])
+          and dec == len(cfg["dec_blk_nums"]) and mid == cfg["middle_blk_num"],
+          f"enc {enc}, dec {dec}, middle {mid}")
+    check("input is 2 channels (raw + signed log)",
+          sd["intro.weight"].size[1] == 2, f"{sd['intro.weight'].size[1]}")
+    check("SR head emits scale^2 = 4 channels",
+          sd["sr_head.0.weight"].size[0] == 4, f"{sd['sr_head.0.weight'].size[0]}")
+    return ck
 
 
-def check_notebook_flags(nb):
-    print("\n3. notebook's train.py flags all exist in train.py")
-    src = open(os.path.join(ROOT, "train.py")).read()
-    tree = ast.parse(src)
-    declared = set()
+def check_inference_cli():
+    print("\n3. inference.py exposes the interface KLA will call")
+    tree = ast.parse(open(os.path.join(ROOT, "inference.py"), encoding="utf-8").read())
+    pos = []
     for n in ast.walk(tree):
         if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "add_argument"):
-            for arg in n.args:
-                if isinstance(arg, ast.Constant) and str(arg.value).startswith("--"):
-                    declared.add(arg.value)
-    # Only the list literal that is handed to train.py counts. Cell 1 also
-    # contains git's own flags (--quiet, --depth), which are not ours.
-    used = set()
-    for c in nb["cells"]:
-        if c["cell_type"] != "code":
-            continue
-        src_c = "\n".join(c["source"])
-        if "train.py" not in src_c:
-            continue
-        for n in ast.walk(ast.parse(src_c)):
-            if isinstance(n, ast.Assign) and any(
-                    isinstance(t, ast.Name) and t.id == "cmd" for t in n.targets):
-                for el in ast.walk(n.value):
-                    if isinstance(el, ast.Constant) and isinstance(el.value, str) \
-                            and el.value.startswith("--"):
-                        used.add(el.value)
-    unknown = sorted(used - declared)
-    check("every flag is declared", not unknown, f"unknown: {unknown}")
-    print(f"         declared: {sorted(declared)}")
+                and n.func.attr == "add_argument" and n.args
+                and isinstance(n.args[0], ast.Constant)
+                and not str(n.args[0].value).startswith("-")):
+            pos.append(n.args[0].value)
+    check("takes input_dir and output_dir positionally",
+          pos[:2] == ["input_dir", "output_dir"], f"found {pos}")
+    # Look for an actual CALL, not the string: the file contains a comment
+    # explaining why torch.compile is avoided, and matching text would flag it.
+    uses_compile = any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "compile" and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "torch"
+        for n in ast.walk(tree))
+    check("does not call torch.compile", not uses_compile)
+    src = open(os.path.join(ROOT, "inference.py"), encoding="utf-8").read()
+    heavy = [m for m in ("lpips", "matplotlib", "scipy", "pandas", "skimage")
+             if re.search(rf"^\s*(import|from)\s+{m}\b", src, re.M)]
+    check("imports stay minimal", not heavy, f"heavy imports: {heavy}")
 
 
-# ---------------------------------------------------------------------------
-def check_import_paths():
-    print("\n4. train.py / evaluate.py can resolve their own imports")
-    # train.py inserts <root>/scripts then imports prepare_photos
-    p = os.path.join(ROOT, "scripts")
-    sys.path.insert(0, p)
-    try:
-        import prepare_photos  # noqa
-        check("train.py can import prepare_photos", True)
-    except Exception as e:
-        check("train.py can import prepare_photos", False, repr(e))
-    # evaluate.py inserts <root>/src then imports model.nafnet_sr
-    ok = os.path.exists(os.path.join(ROOT, "src", "model", "nafnet_sr.py")) and \
-         os.path.exists(os.path.join(ROOT, "src", "model", "__init__.py"))
-    check("evaluate.py's model package is importable", ok)
+def check_intra_repo_imports():
+    """Every top-level module the entry points import must be findable.
+
+    This is the check that would have caught a missing file the last time:
+    the module existed in one working copy, was never committed, and the
+    failure only surfaced on the training machine.
+    """
+    print("\n4. entry points can resolve their imports")
+    src_dir = os.path.join(ROOT, "src")
+    available = {f[:-3] for f in os.listdir(src_dir) if f.endswith(".py")}
+    stdlib_ok = set(sys.builtin_module_names) | {
+        "argparse", "glob", "json", "os", "sys", "time", "re", "ast", "io",
+        "pickle", "zipfile", "subprocess", "collections", "concurrent", "tempfile",
+        "numpy", "torch", "PIL", "functools", "shutil", "math", "random"}
+    for entry in ("inference.py", "train.py"):
+        tree = ast.parse(open(os.path.join(ROOT, entry), encoding="utf-8").read())
+        needed = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+                needed.add(n.module.split(".")[0])
+            elif isinstance(n, ast.Import):
+                for al in n.names:
+                    needed.add(al.name.split(".")[0])
+        unresolved = sorted(m for m in needed
+                            if m not in available and m not in stdlib_ok)
+        check(f"{entry} imports resolve", not unresolved,
+              f"cannot find: {unresolved}")
+        # a src/ module is only importable if the file puts src/ on the path
+        uses_src = bool(needed & available)
+        adds_path = "src" in open(os.path.join(ROOT, entry), encoding="utf-8").read().split("sys.path.insert")[1][:80] \
+            if "sys.path.insert" in open(os.path.join(ROOT, entry), encoding="utf-8").read() else False
+        check(f"{entry} puts src/ on sys.path", (not uses_src) or adds_path)
 
 
-# ---------------------------------------------------------------------------
-def check_unet_balance():
-    print("\n5. U-Net encoder/decoder balance (output must be exactly 2x input)")
-    src = open(os.path.join(ROOT, "src/model/nafnet_sr.py")).read()
-    tree = ast.parse(src)
-    enc = dec = scale = None
-    for n in ast.walk(tree):
-        if isinstance(n, ast.FunctionDef) and n.name == "__init__":
-            for a, d in zip(n.args.args[-len(n.args.defaults):], n.args.defaults):
-                if a.arg == "enc_blocks":
-                    enc = ast.literal_eval(d)
-                elif a.arg == "dec_blocks":
-                    dec = ast.literal_eval(d)
-                elif a.arg == "scale":
-                    scale = ast.literal_eval(d)
-    if enc is None:
-        return check("could read block config", False)
-    check("encoder and decoder stage counts match", len(enc) == len(dec),
-          f"enc={enc} dec={dec}")
-    H = 128; c = 32; size = H; skips = []
-    for _ in enc:
-        skips.append((c, size)); size //= 2; c *= 2
-    for i, _ in enumerate(dec):
-        c //= 2; size *= 2
-        if skips[::-1][i] != (c, size):
-            return check("skip connections line up", False,
-                         f"stage {i}: skip {skips[::-1][i]} vs {(c, size)}")
-    check("skip connections line up", True)
-    check("final size is 2x input", size * scale == H * 2,
-          f"{H} -> {size * scale}, want {H*2}")
-
-
-# ---------------------------------------------------------------------------
-def _stub_torch():
+def check_outputs():
+    print("\n5. restored test outputs")
     import numpy as np
-    class FakeT(np.ndarray):
-        def unsqueeze(self, d): return np.expand_dims(self, d).view(FakeT)
-        def float(self): return self
-    torch = types.ModuleType("torch")
-    torch.initial_seed = lambda: 12345
-    torch.from_numpy = lambda a: np.asarray(a).view(FakeT)
-    utils = types.ModuleType("torch.utils"); data = types.ModuleType("torch.utils.data")
-    class Dataset: pass
-    data.Dataset = Dataset; data.get_worker_info = lambda: None
-    utils.data = data; torch.utils = utils
-    sys.modules.update({"torch": torch, "torch.utils": utils, "torch.utils.data": data})
+    d = os.path.join(ROOT, "outputs/test_out")
+    files = sorted(f for f in os.listdir(d) if f.endswith(".npy")
+                   and not f.startswith("._"))
+    shapes, mn, mx, bad = set(), 1e9, -1e9, 0
+    for f in files:
+        a = np.load(os.path.join(d, f))
+        shapes.add(a.shape)
+        mn = min(mn, float(a.min())); mx = max(mx, float(a.max()))
+        if not np.isfinite(a).all():
+            bad += 1
+    check("400 restored images", len(files) == 400, f"{len(files)}")
+    check("all 256x256 float32", shapes == {(256, 256)}, str(shapes))
+    check("clamped to [0,1]", mn >= 0.0 and mx <= 1.0, f"[{mn:.4f}, {mx:.4f}]")
+    check("no NaN or Inf", bad == 0, f"{bad} bad files")
 
 
-def check_pipeline():
-    print("\n6. data pipeline end to end (torch stubbed)")
-    import numpy as np
-    from PIL import Image
-    _stub_torch()
-    sys.path.insert(0, os.path.join(ROOT, "src"))
-    import dataset as ds
-    from prepare_photos import prepare
+def check_split_and_metrics(ck):
+    print("\n6. split and reported metrics")
+    split = json.load(open(os.path.join(ROOT, "configs/split.json"), encoding="utf-8"))
+    overlap = set(split["train"]) & set(split["val_hard"])
+    check("train and val_hard do not overlap", not overlap, f"{len(overlap)} shared")
+    check("val_hard is 480 samples", len(split["val_hard"]) == 480,
+          f"{len(split['val_hard'])}")
 
-    tmp = tempfile.mkdtemp()
-    try:
-        # fake photo corpus
-        photos = os.path.join(tmp, "photos"); os.makedirs(photos)
-        rng = np.random.default_rng(0)
-        for i in range(4):
-            Image.fromarray((rng.random((600, 800, 3)) * 255).astype(np.uint8)) \
-                 .save(os.path.join(photos, f"p{i}.png"))
-        cache = os.path.join(tmp, "cache")
-        prepare(photos, cache, verbose=False)
+    m = json.load(open(os.path.join(ROOT, "outputs/results/metrics.json"), encoding="utf-8"))
+    s = m["summary"]
+    check("metrics cover the whole val_hard set", m["n_val"] == len(split["val_hard"]),
+          f"metrics {m['n_val']} vs split {len(split['val_hard'])}")
+    check("model beats bicubic on PSNR", s["psnr"]["mean"] > s["psnr_base"]["mean"],
+          f"{s['psnr']['mean']:.2f} vs {s['psnr_base']['mean']:.2f} dB")
+    check("model beats bicubic on SSIM", s["ssim"]["mean"] > s["ssim_base"]["mean"],
+          f"{s['ssim']['mean']:.4f} vs {s['ssim_base']['mean']:.4f}")
+    check("model beats bicubic on LPIPS (lower is better)",
+          s["lpips"]["mean"] < s["lpips_base"]["mean"],
+          f"{s['lpips']['mean']:.4f} vs {s['lpips_base']['mean']:.4f}")
+    check("metrics params match the checkpoint",
+          m["params"] == sum(
+              (lambda v: [__import__('functools').reduce(lambda x, y: x*y, v.size, 1)])(v)[0]
+              for v in ck["model"].values() if hasattr(v, "size")),
+          f"metrics says {m['params']:,}")
 
-        # fake KLA pairs, deliberately including values above 1.5
-        real = os.path.join(tmp, "real")
-        os.makedirs(os.path.join(real, "GT")); os.makedirs(os.path.join(real, "NoisyLR"))
-        names = []
-        for i in range(6):
-            g = rng.random((256, 256)).astype(np.float32)
-            g = (g - g.min()) / (g.max() - g.min())
-            l = (rng.random((128, 128)).astype(np.float32) * 1.9) - 0.1   # 1.8 max, negatives
-            np.save(os.path.join(real, "GT", f"{i:06d}.npy"), g)
-            np.save(os.path.join(real, "NoisyLR", f"{i:06d}.npy"), l)
-            names.append(f"{i:06d}.npy")
-
-        cfg = os.path.join(ROOT, "configs/degradation_config.json")
-
-        for label, folder in [("cached .npy", cache), ("raw .png", photos)]:
-            d = ds.SyntheticDataset(folder, cfg, gt_size=256, length=20)
-            lr, gt = d[0]
-            ok = (tuple(gt.shape) == (1, 256, 256) and tuple(lr.shape) == (1, 128, 128)
-                  and abs(gt.min()) < 1e-6 and abs(gt.max() - 1) < 1e-6)
-            check(f"synthetic [{label}] shapes and GT range", ok,
-                  f"gt{tuple(gt.shape)} lr{tuple(lr.shape)} gt[{gt.min():.4f},{gt.max():.4f}]")
-
-        # THE BUG THAT COST A TRAINING RUN: values above 1.5 must survive intact
-        r = ds.RealPairDataset(real, names=names)
-        lr, gt = r[0]
-        raw = np.load(os.path.join(real, "NoisyLR", "000000.npy"))
-        check("NoisyLR above 1.5 is NOT rescaled", abs(float(lr.max()) - float(raw.max())) < 1e-5,
-              f"loaded max {float(lr.max()):.4f} vs file max {float(raw.max()):.4f}")
-        check("negative pixels preserved", float(lr.min()) < 0, f"min {float(lr.min()):.4f}")
-
-        # cropped variant must keep LR aligned at exactly half of GT
-        rc = ds.RealPairDataset(real, names=names, gt_size=128)
-        lr, gt = rc[0]
-        check("cropped real pair stays 2:1", tuple(gt.shape) == (1, 128, 128)
-              and tuple(lr.shape) == (1, 64, 64), f"gt{tuple(gt.shape)} lr{tuple(lr.shape)}")
-
-        # Mixed dataset, configured exactly as train.py does it: the synthetic
-        # and real halves MUST share gt_size, or a batch contains two different
-        # shapes and the DataLoader raises when it tries to stack them.
-        r_train = ds.RealPairDataset(real, names=names, gt_size=256)
-        m = ds.MixedDataset(ds.SyntheticDataset(cache, cfg, 256, 40), r_train,
-                            real_frac=0.25, length=16)
-        shapes = {(tuple(m[i][0].shape), tuple(m[i][1].shape)) for i in range(16)}
-        check("every mixed sample has an identical shape", len(shapes) == 1, str(shapes))
-        drew_real = any(m.__getitem__(i) is not None for i in range(0, 16, 4))
-        check("mixed dataset draws from the real set too", drew_real)
-
-        # split file references real files
-        split = json.load(open(os.path.join(ROOT, "configs/split.json")))
-        check("split.json has all three sets",
-              all(k in split for k in ("train", "val_easy", "val_hard")),
-              f"train {len(split.get('train',[]))} easy {len(split.get('val_easy',[]))} "
-              f"hard {len(split.get('val_hard',[]))}")
-        overlap = set(split["train"]) & set(split["val_hard"])
-        check("train and val_hard do not overlap", not overlap, f"{len(overlap)} shared")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    # the README's headline numbers must match metrics.json
+    rd = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+    for val, label in [(f"{s['psnr']['mean']:.2f}", "PSNR"),
+                       (f"{s['ssim']['mean']:.4f}", "SSIM"),
+                       (f"{s['lpips']['mean']:.4f}", "LPIPS")]:
+        check(f"README quotes the measured {label} ({val})", val in rd)
 
 
-# ---------------------------------------------------------------------------
 def main():
     print("PREFLIGHT")
-    check_files_present()
-    nb = check_notebook()
-    check_notebook_flags(nb)
-    check_import_paths()
-    check_unet_balance()
-    check_pipeline()
-    print("\n" + "=" * 60)
+    check_files()
+    ck = check_architecture()
+    check_inference_cli()
+    check_intra_repo_imports()
+    check_outputs()
+    check_split_and_metrics(ck)
+    print("\n" + "=" * 62)
     if FAILS:
         print(f"{len(FAILS)} CHECK(S) FAILED:")
         for f in FAILS:

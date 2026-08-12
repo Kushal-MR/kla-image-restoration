@@ -1,0 +1,5 @@
+# Model weights and restored outputs are binary and large. Git LFS keeps the
+# repository itself small and, for best.pt (104 MB), is mandatory: GitHub
+# rejects any single file over 100 MB on a normal push.
+weights/*.pt          filter=lfs diff=lfs merge=lfs -text
+outputs/test_out/*.npy filter=lfs diff=lfs merge=lfs -text

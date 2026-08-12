@@ -1,20 +1,16 @@
-# data — never commit these, they are hundreds of MB
+# Datasets are hundreds of MB and are supplied by the organisers, not us.
 data/
-*.zip
 train/
 Test_NoisyLR/
+*.zip
 **/GT/
 **/NoisyLR/
+DIV2K*/
 
-# model weights are tracked with Git LFS (see README); ignore stray ones
-*.pt
-*.pth
-*.onnx
-!weights/.gitkeep
-
-# restored outputs
-outputs/*
-!outputs/.gitkeep
+# NOTE: weights/ and outputs/ are deliberately NOT ignored. The hackathon
+# requires the trained weights and the restored test outputs to be in the
+# repository. They are large binaries, so .gitattributes routes them through
+# Git LFS -- see the README.
 
 # python
 __pycache__/
@@ -27,5 +23,6 @@ env/
 # os / editor
 .DS_Store
 __MACOSX/
+._*
 .vscode/
 .idea/
