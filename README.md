@@ -269,7 +269,7 @@ inference — not just the forward pass. This matters more than it sounds:
 | | ms/image |
 |---|---|
 | forward pass alone | 8.05 |
-| **end-to-end measured (median)** | **30.2** |
+| **end-to-end measured (mean)** | **30.2** |
 
 **69% of the measured time is not the model.** Accordingly:
 
