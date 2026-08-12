@@ -11,7 +11,7 @@ full-resolution image in one pass.
 |---|---|
 | Architecture | NAFNet-w32, pixel-shuffle ×2 head, bicubic residual skip |
 | Parameters | 29.16 M |
-| Inference | 10.4 s for 400 images end-to-end (26.1 ms/image, Tesla T4, batch 16; median of six runs) |
+| Inference | 12.1 s for 400 images end-to-end (30.2 ms/image, Tesla T4, batch 16; median of six runs) |
 | val_hard PSNR / SSIM / LPIPS | **26.68 dB / 0.6859 / 0.3755** |
 | bicubic baseline | 22.87 dB / 0.5410 / 0.4480 |
 
