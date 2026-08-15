@@ -1,7 +1,7 @@
 # AI-Based Restoration of Degraded Images
 
 **SEMICON India Hackathon 2026 — Problem Statement 01 (KLA)**
-Team **[TEAM_NAME]**
+Team **CacheUs**
 
 Single-stage restoration of speckle-degraded, 2×-downsampled greyscale images.
 A modified NAFNet takes the degraded low-resolution image and produces a clean
